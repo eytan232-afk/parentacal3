@@ -24,4 +24,10 @@ body {
     max-width: none;
     padding: 0;
   }
+
+  /* עוזר לדפדפנים מסוימים להתיישר על A4 */
+  @page {
+    size: A4;
+    margin: 0;
+  }
 }

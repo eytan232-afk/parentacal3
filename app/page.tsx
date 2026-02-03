@@ -1,7 +1,7 @@
 "use client";
 
 import Image from "next/image";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { formulas, STD_ELECTROLYTES_FROM_TRIOMEL_N7E_1P5 } from "./data/formulas";
 
 /* ---------------- helpers ---------------- */
@@ -86,6 +86,9 @@ type Inputs = {
   dietitian: string;
   phone: string;
 
+  homeStartDate: string; // YYYY-MM-DD
+  prescriptionValidUntil: string; // YYYY-MM-DD
+
   catheterType: CatheterType;
 
   // additives
@@ -149,13 +152,45 @@ type Candidate = {
   minHours: number | null;
 };
 
-/* -------------- pharmacist phones -------------- */
 const PHARM_LINES = [
   { label: "ייעוץ רוקחי 1", phone: "08-6919320" },
   { label: "ייעוץ רוקחי 2", phone: "08-6919322" },
   { label: "ייעוץ רוקחי 3", phone: "08-6919327" },
   { label: "ייעוץ רוקחי 4", phone: "08-6919340" },
 ];
+
+/* ------------------- TRIOMEL N4 electrolytes ------------------- */
+/**
+ * Values are mmol per BAG (base bag), then scaled by ratio (selected volume / base volume).
+ * Source: "מניפה 26 תקינה.pdf", page 1, Triomel N4E column.
+ */
+const STD_ELECTROLYTES_TRIOMEL_N4E_BY_VOLUME: Record<
+  number,
+  { na: number; k: number; mg: number; ca: number; phos: number; acetate: number; chloride: number }
+> = {
+  2000: { na: 42, k: 32, mg: 4.4, ca: 4, phos: 17, acetate: 55, chloride: 49 },
+  2500: { na: 52.5, k: 40, mg: 5.5, ca: 5, phos: 21.2, acetate: 69, chloride: 61 },
+};
+
+function isTriomelN4Formula(f: any) {
+  const hay = normKey(`${f?.brand ?? ""} ${f?.name ?? ""} ${f?.id ?? ""}`);
+  return hay.includes("triomel") && (hay.includes(" n4") || hay.includes("n4e"));
+}
+
+function getStandardElectrolytesBase(f: any, v: any) {
+  // ✅ Triomel N4E → N4 electrolytes by base bag volume
+  if (isTriomelN4Formula(f)) {
+    const byVol = STD_ELECTROLYTES_TRIOMEL_N4E_BY_VOLUME[v?.volumeMl];
+    if (byVol) return byVol;
+
+    const vol = Number(v?.volumeMl) || 0;
+    const pick = Math.abs(vol - 2000) <= Math.abs(vol - 2500) ? 2000 : 2500;
+    return STD_ELECTROLYTES_TRIOMEL_N4E_BY_VOLUME[pick];
+  }
+
+  // ✅ default standard behavior
+  return STD_ELECTROLYTES_FROM_TRIOMEL_N7E_1P5;
+}
 
 function computeHoursRateGIR(args: {
   weightKg: number;
@@ -166,19 +201,12 @@ function computeHoursRateGIR(args: {
   const w = Math.max(1, args.weightKg);
   const minH = minHoursByDex(args.dextroseG, w, GIR_MAX);
 
-  const planned =
-    args.hoursPlanned && args.hoursPlanned > 0 ? args.hoursPlanned : null;
+  const planned = args.hoursPlanned && args.hoursPlanned > 0 ? args.hoursPlanned : null;
   const usedHours = planned ?? minH;
-  const source: "planned" | "min" | "none" = planned
-    ? "planned"
-    : minH
-    ? "min"
-    : "none";
+  const source: "planned" | "min" | "none" = planned ? "planned" : minH ? "min" : "none";
 
   const rate = usedHours ? args.fluidMl / usedHours : null;
-  const girActual = usedHours
-    ? (args.dextroseG * 1000) / (w * (usedHours * 60))
-    : null;
+  const girActual = usedHours ? (args.dextroseG * 1000) / (w * (usedHours * 60)) : null;
 
   return { minH, usedHours, source, rate, girActual };
 }
@@ -226,9 +254,7 @@ function computeCandidate(
 
   const ratio = volMl / v.volumeMl;
 
-  const eBase = f.isStandard
-    ? STD_ELECTROLYTES_FROM_TRIOMEL_N7E_1P5
-    : v.electrolytes;
+  const eBase = f.isStandard ? getStandardElectrolytesBase(f, v) : v.electrolytes;
 
   const kcal = v.caloriesKcal * ratio;
   const proteinG = v.aminoAcidsG * ratio;
@@ -258,6 +284,8 @@ function computeCandidate(
           phos: eBase.phos * ratio,
           acetate: eBase.acetate * ratio,
           chloride: eBase.chloride * ratio,
+
+          // נשאר כמו אצלך (למקרה שהיה "acetate2" בנתונים אחרים)
           acetate2: eBase.acetate * ratio,
         }
       : undefined,
@@ -265,10 +293,8 @@ function computeCandidate(
 
   if (delivered.electrolytes) {
     delivered.electrolytes.acetate =
-      delivered.electrolytes.acetate2 ??
-      delivered.electrolytes.acetate ??
-      0;
-    delivered.electrolytes.acetate2 = 0; // במקום delete
+      delivered.electrolytes.acetate2 ?? delivered.electrolytes.acetate ?? 0;
+    delivered.electrolytes.acetate2 = 0;
   }
 
   const diffs = {
@@ -302,9 +328,7 @@ function computeCandidate(
   const score = aF * wF + aK * wK + aP * wP;
   const minH = minHoursByDex(delivered.dextroseG, w, GIR_MAX);
 
-  const baseVolumes = (f.variants ?? [])
-    .map((x: any) => x.volumeMl)
-    .filter(Boolean);
+  const baseVolumes = (f.variants ?? []).map((x: any) => x.volumeMl).filter(Boolean);
   const preferredVolMl = nearestPreferredVolume(volMl, baseVolumes);
 
   return {
@@ -362,18 +386,11 @@ function MetricRow({
   );
 }
 
-function BottomLine({
-  items,
-}: {
-  items: Array<{ label: string; value: string }>;
-}) {
+function BottomLine({ items }: { items: Array<{ label: string; value: string }> }) {
   return (
     <div className="text-[11px] text-slate-600 flex flex-wrap gap-x-3 gap-y-1 justify-center">
       {items.map((it, idx) => (
-        <span
-          key={idx}
-          className="inline-flex items-baseline gap-1 whitespace-nowrap"
-        >
+        <span key={idx} className="inline-flex items-baseline gap-1 whitespace-nowrap">
           <span className="text-slate-600">{it.label}</span>
           <span className="font-semibold text-slate-800">{it.value}</span>
         </span>
@@ -382,7 +399,17 @@ function BottomLine({
   );
 }
 
+type ComputeSnapshot = {
+  inp: Inputs;
+  w: number;
+  targets: { kcal: number; protein: number; fluid: number };
+};
+
 export default function Page() {
+  useEffect(() => {
+    document.title = "TPN / SPN";
+  }, []);
+
   const [inp, setInp] = useState<Inputs>({
     weightKg: 70,
     kcalPerKg: 30,
@@ -396,6 +423,9 @@ export default function Page() {
     ward: "",
     dietitian: "",
     phone: "",
+
+    homeStartDate: "",
+    prescriptionValidUntil: "",
 
     catheterType: "PICC",
 
@@ -419,22 +449,50 @@ export default function Page() {
     notes: "",
   });
 
-  const w = Math.max(1, inp.weightKg);
+  const [computed, setComputed] = useState<ComputeSnapshot | null>(null);
 
-  const targets = useMemo(
+  function patchInp(patch: Partial<Inputs>) {
+    setInp((s) => ({ ...s, ...patch }));
+    setComputed(null);
+    setOpenKey(null);
+  }
+
+  const wLive = Math.max(1, inp.weightKg);
+  const targetsLive = useMemo(
     () => ({
+      kcal: inp.kcalPerKg * wLive,
+      protein: inp.proteinPerKg * wLive,
+      fluid: inp.fluidMlPerKg * wLive,
+    }),
+    [inp.kcalPerKg, inp.proteinPerKg, inp.fluidMlPerKg, wLive]
+  );
+
+  const isReadyToCompute = useMemo(() => {
+    const okNum = (n: any) => typeof n === "number" && isFinite(n) && n > 0;
+    return (
+      okNum(inp.weightKg) &&
+      okNum(inp.kcalPerKg) &&
+      okNum(inp.proteinPerKg) &&
+      okNum(inp.fluidMlPerKg)
+    );
+  }, [inp.weightKg, inp.kcalPerKg, inp.proteinPerKg, inp.fluidMlPerKg]);
+
+  function doCompute() {
+    const w = Math.max(1, inp.weightKg);
+    const targets = {
       kcal: inp.kcalPerKg * w,
       protein: inp.proteinPerKg * w,
       fluid: inp.fluidMlPerKg * w,
-    }),
-    [inp.kcalPerKg, inp.proteinPerKg, inp.fluidMlPerKg, w]
-  );
+    };
+    setComputed({ inp, w, targets });
+  }
 
   const all = useMemo(() => {
+    if (!computed) return { list: [] as Candidate[], top3: [] as Candidate[] };
+
     const list: Candidate[] = [];
     for (const f of formulas as any[]) {
-      for (const v of f.variants as any[])
-        list.push(computeCandidate(inp, f, v, targets));
+      for (const v of f.variants as any[]) list.push(computeCandidate(computed.inp, f, v, computed.targets));
     }
     list.sort((a, b) => a.score - b.score);
 
@@ -448,7 +506,7 @@ export default function Page() {
       .slice(0, 3);
 
     return { list, top3 };
-  }, [inp, targets]);
+  }, [computed]);
 
   const [openKey, setOpenKey] = useState<string | null>(null);
   const selected = useMemo(
@@ -481,12 +539,15 @@ export default function Page() {
   const modalCalc = useMemo(() => {
     if (!modalBase) return null;
 
+    const w = computed?.w ?? Math.max(1, inp.weightKg);
+    const targets = computed?.targets ?? targetsLive;
+
     const base = modalBase.variant;
     const volMl = clamp(modalVol || modalBase.volMl, 500, 2500);
     const ratio = volMl / base.volumeMl;
 
     const eBase = modalBase.formula.isStandard
-      ? STD_ELECTROLYTES_FROM_TRIOMEL_N7E_1P5
+      ? getStandardElectrolytesBase(modalBase.formula, base)
       : base.electrolytes;
 
     const kcal = base.caloriesKcal * ratio;
@@ -531,36 +592,34 @@ export default function Page() {
 
     const nG = nitrogenG(delivered.proteinG);
 
-    return { delivered, diffs, hrs, nG };
-  }, [
-    modalBase,
-    modalVol,
-    targets.kcal,
-    targets.protein,
-    targets.fluid,
-    inp.hoursPlanned,
-    w,
-  ]);
+    return { delivered, diffs, hrs, nG, w, targets };
+  }, [modalBase, modalVol, inp.hoursPlanned, inp.weightKg, targetsLive, computed]);
 
   const [pharmOpen, setPharmOpen] = useState(false);
 
-  function buildMailtoForSelf(payloadText: string) {
-    const to = "remedix.beity@remedix-care.co.il";
-    const subject = encodeURIComponent("מרשם הזנה - TPN/SPN");
-    const body = encodeURIComponent(payloadText);
-    return `mailto:${to}?subject=${subject}&body=${body}`;
+  // -------- Exposure Flow (PRINT ONLY) --------
+  const [askExposureOpen, setAskExposureOpen] = useState(false);
+
+  function requestPrintWithExposure() {
+    if (!modalBase || !modalCalc) return;
+    setAskExposureOpen(true);
   }
 
-  function printPrescription() {
-    if (!modalBase || !modalCalc) return;
+  function buildPrintPayload(args: { exposureBag: boolean }) {
+    if (!modalBase || !modalCalc) return null;
 
-    const payload = {
+    const w = modalCalc.w;
+
+    return {
       createdAt: new Date().toLocaleString("he-IL"),
 
       hospital: inp.hospital,
       ward: inp.ward,
       dietitian: inp.dietitian,
       phone: inp.phone,
+
+      homeStartDate: inp.homeStartDate || "",
+      prescriptionValidUntil: inp.prescriptionValidUntil || "",
 
       catheterType: inp.catheterType,
 
@@ -576,29 +635,21 @@ export default function Page() {
 
       dextroseG: Number(modalCalc.delivered.dextroseG.toFixed(1)),
       lipidsG: Number(modalCalc.delivered.lipidsG.toFixed(1)),
-      minHoursGIR: modalCalc.hrs.minH
-        ? Number(modalCalc.hrs.minH.toFixed(1))
-        : null,
+      minHoursGIR: modalCalc.hrs.minH ? Number(modalCalc.hrs.minH.toFixed(1)) : null,
 
-      hoursUsed: modalCalc.hrs.usedHours
-        ? Number(modalCalc.hrs.usedHours.toFixed(1))
-        : null,
+      hoursUsed: modalCalc.hrs.usedHours ? Number(modalCalc.hrs.usedHours.toFixed(1)) : null,
       hoursSource: modalCalc.hrs.source,
       rateMlH: modalCalc.hrs.rate ? Math.round(modalCalc.hrs.rate) : null,
-      girActual: modalCalc.hrs.girActual
-        ? Number(modalCalc.hrs.girActual.toFixed(2))
-        : null,
+      girActual: modalCalc.hrs.girActual ? Number(modalCalc.hrs.girActual.toFixed(2)) : null,
 
       npcKcal: Math.round(modalCalc.delivered.npcKcal),
       nG: Number(modalCalc.nG.toFixed(2)),
-      npcToN: modalCalc.delivered.npcToN
-        ? Number(modalCalc.delivered.npcToN.toFixed(1))
-        : null,
-      nToNpc: modalCalc.delivered.nToNpc
-        ? Number(modalCalc.delivered.nToNpc.toFixed(4))
-        : null,
+      npcToN: modalCalc.delivered.npcToN ? Number(modalCalc.delivered.npcToN.toFixed(1)) : null,
+      nToNpc: modalCalc.delivered.nToNpc ? Number(modalCalc.delivered.nToNpc.toFixed(4)) : null,
 
       electrolytes: modalCalc.delivered.electrolytes ?? null,
+
+      exposureBag: args.exposureBag,
 
       additives: {
         cernevitMl: inp.cernevitMl,
@@ -610,15 +661,10 @@ export default function Page() {
 
       lineCare: {
         saline: { label: "NaCl 0.9% 10cc", timesPerDay: 2 },
-        heparin: inp.wantHeparin
-          ? { label: inp.heparinDose, timesPerDay: 1 }
-          : null,
+        heparin: inp.wantHeparin ? { label: inp.heparinDose, timesPerDay: 1 } : null,
         tauroLock: inp.wantTauroLock ? { label: "TauroLock", ml: 2 } : null,
         taurolidine: inp.wantTaurolidine
-          ? {
-              label: "Taurolidine 2%",
-              ml: Math.max(0, Number(inp.taurolidineMl) || 0),
-            }
+          ? { label: "Taurolidine 2%", ml: Math.max(0, Number(inp.taurolidineMl) || 0) }
           : null,
       },
 
@@ -628,61 +674,21 @@ export default function Page() {
 
       notes: inp.notes,
     };
+  }
+
+  function printPrescription(exposureBag: boolean) {
+    const payload = buildPrintPayload({ exposureBag });
+    if (!payload) return;
 
     localStorage.setItem("tpn_print_payload_v3", JSON.stringify(payload));
     window.open("/print/prescription", "_blank", "noopener,noreferrer");
   }
 
-  function emailToSelfFromSummary() {
-    if (!modalBase || !modalCalc) return;
+  const heparinDisabled = !inp.wantHeparin && (inp.wantTauroLock || inp.wantTaurolidine);
+  const tauroLockDisabled = !inp.wantTauroLock && (inp.wantHeparin || inp.wantTaurolidine);
+  const taurolidineDisabled = !inp.wantTaurolidine && (inp.wantHeparin || inp.wantTauroLock);
 
-    const treatDays = clamp(Math.round(inp.treatmentDaysPerWeek), 1, 7);
-    const vitK = inp.vitaminK150 ? "כן" : "לא";
-
-    const lockLine = inp.wantHeparin
-      ? `Heparin: ${inp.heparinDose} (1/יום)`
-      : inp.wantTauroLock
-      ? `TauroLock: כן (2 mL)`
-      : inp.wantTaurolidine
-      ? `Taurolidine 2%: כן (${Math.max(0, Number(inp.taurolidineMl) || 0)} mL)`
-      : `Lock: ללא`;
-
-    const text =
-      `מרשם מה-TPN/SPN Tool\n\n` +
-      `מוסד:\n` +
-      `בית חולים: ${inp.hospital || "—"}\nמחלקה: ${inp.ward || "—"}\nדיאטנית: ${inp.dietitian || "—"}\nטלפון: ${inp.phone || "—"}\n` +
-      `סוג צנתר: ${inp.catheterType || "—"}\n` +
-      `ימי טיפול בשבוע: ${treatDays}/7\n` +
-      `Vitamin K 150 mcg/day: ${vitK}\n` +
-      `האם יש צורך בשקית חשיפה? □ כן  □ לא\n\n` +
-      `תמיסה: ${modalBase.groupTitle} • ${modalBase.variant.label}\n` +
-      `נפח: ${Math.round(modalCalc.delivered.fluidMl)} mL\n` +
-      `קילו-קלוריות: ${Math.round(modalCalc.delivered.kcal)} kcal\n` +
-      `חלבון: ${fmt(modalCalc.delivered.proteinG, 1)} g\n` +
-      `שומן: ${fmt(modalCalc.delivered.lipidsG, 1)} g\n` +
-      `דקסטרוז: ${fmt(modalCalc.delivered.dextroseG, 1)} g\n\n` +
-      `NPC: ${Math.round(modalCalc.delivered.npcKcal)} kcal\n` +
-      `N: ${fmt(modalCalc.nG, 2)} g\n` +
-      `NPC:N: ${
-        modalCalc.delivered.npcToN ? fmt(modalCalc.delivered.npcToN, 1) : "—"
-      }\n` +
-      `N:NPC: ${
-        modalCalc.delivered.nToNpc ? fmt(modalCalc.delivered.nToNpc, 4) : "—"
-      }\n\n` +
-      `Line care:\n` +
-      `NaCl 0.9% 10cc — 2/יום\n` +
-      `${lockLine}\n`;
-
-    window.location.href = buildMailtoForSelf(text);
-  }
-
-  // ✅ בלעדיות בין Heparin / Taurolock / Taurolidine
-  const heparinDisabled =
-    !inp.wantHeparin && (inp.wantTauroLock || inp.wantTaurolidine);
-  const tauroLockDisabled =
-    !inp.wantTauroLock && (inp.wantHeparin || inp.wantTaurolidine);
-  const taurolidineDisabled =
-    !inp.wantTaurolidine && (inp.wantHeparin || inp.wantTauroLock);
+  const computedW = computed?.w ?? wLive;
 
   return (
     <div
@@ -692,8 +698,8 @@ export default function Page() {
       {/* Header */}
       <header className="sticky top-0 z-20 bg-white/85 backdrop-blur border-b border-slate-200">
         <div className="mx-auto max-w-6xl px-4 py-3">
-          <div className="flex items-center justify-between gap-3">
-            <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-3 min-w-0">
               <div className="h-12 w-12 rounded-2xl bg-white ring-1 ring-slate-200 shadow-sm overflow-hidden flex items-center justify-center">
                 <Image
                   src="/remedix-logo.png"
@@ -704,13 +710,15 @@ export default function Page() {
                   priority
                 />
               </div>
-              <div className="leading-tight">
-                <div className="text-[15px] font-extrabold text-slate-900">
-                  TPN / SPN
-                </div>
-                <div className="text-[11px] text-slate-500">
-                  כלי לחישוב הזנה פרה אנטרלית
-                </div>
+              <div className="leading-tight min-w-0">
+                <div className="text-[15px] font-extrabold text-slate-900">TPN / SPN</div>
+                <div className="text-[11px] text-slate-500">כלי לחישוב הזנה פרה אנטרלית</div>
+              </div>
+            </div>
+
+            <div className="flex-1 text-center">
+              <div className="text-blue-700 font-black tracking-wide text-lg sm:text-xl drop-shadow-sm">
+                Parenta-cal
               </div>
             </div>
 
@@ -733,28 +741,24 @@ export default function Page() {
       </header>
 
       <main className="mx-auto max-w-6xl px-4 py-5 space-y-4">
-        {/* Targets + Inputs (גורם מגביל נשאר למעלה) */}
+        {/* Targets + Inputs */}
         <section className="rounded-3xl bg-white p-4 shadow-sm ring-1 ring-slate-200">
           <div className="flex items-center justify-between">
             <div className="text-base font-extrabold">יעדים לפי ק״ג</div>
             <div className="text-xs text-slate-500">
-              סה״כ: {Math.round(targets.kcal)} kcal •{" "}
-              {targets.protein.toFixed(1)} g • {Math.round(targets.fluid)} mL
+              סה״כ: {Math.round(targetsLive.kcal)} kcal • {targetsLive.protein.toFixed(1)} g •{" "}
+              {Math.round(targetsLive.fluid)} mL
             </div>
           </div>
 
           <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-12">
             <div className="md:col-span-3">
-              <label className="text-xs font-semibold text-slate-600">
-                משקל (kg)
-              </label>
+              <label className="text-xs font-semibold text-slate-600">משקל (kg)</label>
               <input
                 className="mt-2 w-full rounded-2xl border border-slate-200 px-3 py-2 text-sm"
                 type="number"
                 value={inp.weightKg}
-                onChange={(e) =>
-                  setInp((s) => ({ ...s, weightKg: Number(e.target.value) }))
-                }
+                onChange={(e) => patchInp({ weightKg: Number(e.target.value) })}
               />
             </div>
 
@@ -767,9 +771,7 @@ export default function Page() {
                 type="number"
                 value={inp.kcalPerKg}
                 step={0.5}
-                onChange={(e) =>
-                  setInp((s) => ({ ...s, kcalPerKg: Number(e.target.value) }))
-                }
+                onChange={(e) => patchInp({ kcalPerKg: Number(e.target.value) })}
               />
             </div>
 
@@ -782,12 +784,7 @@ export default function Page() {
                 type="number"
                 value={inp.proteinPerKg}
                 step={0.05}
-                onChange={(e) =>
-                  setInp((s) => ({
-                    ...s,
-                    proteinPerKg: Number(e.target.value),
-                  }))
-                }
+                onChange={(e) => patchInp({ proteinPerKg: Number(e.target.value) })}
               />
             </div>
 
@@ -800,17 +797,12 @@ export default function Page() {
                 type="number"
                 value={inp.fluidMlPerKg}
                 step={1}
-                onChange={(e) =>
-                  setInp((s) => ({
-                    ...s,
-                    fluidMlPerKg: Number(e.target.value),
-                  }))
-                }
+                onChange={(e) => patchInp({ fluidMlPerKg: Number(e.target.value) })}
               />
             </div>
           </div>
 
-          {/* ✅ גורם מגביל נשאר למעלה */}
+          {/* limiting factor */}
           <div className="mt-3 rounded-3xl bg-blue-50 p-3 ring-1 ring-blue-200">
             <div className="text-[11px] font-extrabold text-blue-900">
               גורם מגביל (TOP 3)
@@ -819,10 +811,7 @@ export default function Page() {
               className="mt-2 w-full rounded-2xl border border-blue-200 px-3 py-2 text-sm bg-white"
               value={inp.limitingFactor}
               onChange={(e) =>
-                setInp((s) => ({
-                  ...s,
-                  limitingFactor: e.target.value as LimitingFactor,
-                }))
+                patchInp({ limitingFactor: e.target.value as LimitingFactor })
               }
             >
               <option value="none">ללא (מאוזן)</option>
@@ -836,7 +825,7 @@ export default function Page() {
           </div>
         </section>
 
-        {/* ✅ שעות הזנה ירדו למטה – מעל ההמלצות */}
+        {/* hours + compute */}
         <section className="rounded-3xl bg-white p-4 shadow-sm ring-1 ring-slate-200">
           <div className="text-base font-extrabold">שעות הזנה</div>
           <div className="text-xs text-slate-500 mt-1">
@@ -849,17 +838,55 @@ export default function Page() {
             placeholder="לדוגמה: 12 / 16 / 24"
             value={inp.hoursPlanned ?? ""}
             onChange={(e) =>
-              setInp((s) => ({
-                ...s,
-                hoursPlanned:
-                  e.target.value === "" ? undefined : Number(e.target.value),
-              }))
+              patchInp({
+                hoursPlanned: e.target.value === "" ? undefined : Number(e.target.value),
+              })
             }
           />
           <div className="mt-2 text-[10px] text-slate-600">GIRmax={GIR_MAX}</div>
+
+          <div className="mt-4 flex flex-col sm:flex-row gap-2 justify-between items-stretch">
+            <button
+              onClick={doCompute}
+              className={cn(
+                "relative overflow-hidden rounded-2xl px-4 py-3 text-xs font-extrabold ring-1 transition-all duration-200 active:scale-[0.99] hover:-translate-y-0.5",
+                !isReadyToCompute && "bg-white text-slate-800 ring-slate-200 hover:shadow-sm",
+                isReadyToCompute &&
+                  !computed &&
+                  "bg-gradient-to-r from-emerald-500 to-emerald-600 text-white ring-emerald-600 shadow-md hover:from-emerald-600 hover:to-emerald-700",
+                isReadyToCompute &&
+                  computed &&
+                  "bg-gradient-to-r from-emerald-600 to-emerald-700 text-white ring-emerald-700 shadow-md"
+              )}
+            >
+              {isReadyToCompute && !computed ? (
+                <span className="pointer-events-none absolute inset-0 opacity-0 transition-opacity duration-200 hover:opacity-100">
+                  <span className="absolute -left-1/2 top-0 h-full w-1/2 -skew-x-12 bg-white/20" />
+                </span>
+              ) : null}
+
+              <span className="relative flex items-center justify-center gap-2">
+                <span className={cn("h-2 w-2 rounded-full", isReadyToCompute ? "bg-white/90" : "bg-slate-300")} />
+                <span>{computed ? "חישוב בוצע (לחץ לחישוב מחדש)" : "חשב פורמולות מומלצות"}</span>
+              </span>
+            </button>
+
+            <div className="rounded-2xl bg-slate-50 px-4 py-3 ring-1 ring-slate-200 text-[11px] text-slate-700 flex items-center justify-center">
+              {computed ? (
+                <span>
+                  חישוב בוצע. משקל: <b>{computed.w}</b> • יעד קלורי:{" "}
+                  <b>{Math.round(computed.targets.kcal)}</b> kcal
+                </span>
+              ) : (
+                <span>
+                  ההמלצות יוצגו רק אחרי לחיצה על <b>“חשב פורמולות מומלצות”</b>
+                </span>
+              )}
+            </div>
+          </div>
         </section>
 
-        {/* Top3 */}
+        {/* TOP3 */}
         <section className="rounded-3xl bg-white p-4 shadow-sm ring-1 ring-slate-200">
           <div className="mb-3 flex items-end justify-between">
             <div>
@@ -869,120 +896,107 @@ export default function Page() {
               </div>
             </div>
             <div className="text-xs text-slate-600">
-              מסודר לפי:{" "}
-              <b>{inp.limitingFactor === "none" ? "מאוזן" : inp.limitingFactor}</b>
+              מסודר לפי: <b>{inp.limitingFactor === "none" ? "מאוזן" : inp.limitingFactor}</b>
             </div>
           </div>
 
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-            {all.top3.map((c, idx) => {
-              const rank = idx + 1;
+          {!computed ? (
+            <div className="rounded-3xl bg-slate-50 p-4 ring-1 ring-slate-200 text-sm text-slate-700">
+              כדי לראות המלצות — מלא/י נתונים ואז לחץ/י <b>“חשב פורמולות מומלצות”</b>.
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+              {all.top3.map((c, idx) => {
+                const rank = idx + 1;
 
-              const kcalKg = c.delivered.kcal / w;
-              const protKg = c.delivered.proteinG / w;
-              const fluidKg = c.delivered.fluidMl / w;
+                const kcalKg = c.delivered.kcal / computedW;
+                const protKg = c.delivered.proteinG / computedW;
+                const fluidKg = c.delivered.fluidMl / computedW;
 
-              const hrs = computeHoursRateGIR({
-                weightKg: w,
-                dextroseG: c.delivered.dextroseG,
-                fluidMl: c.delivered.fluidMl,
-                hoursPlanned: inp.hoursPlanned,
-              });
-              const fullTitle = `${c.groupTitle} • ${c.variant.label} (מומלץ ${c.preferredVolMl.toLocaleString(
-                "en-US"
-              )} mL)`;
+                const hrs = computeHoursRateGIR({
+                  weightKg: computedW,
+                  dextroseG: c.delivered.dextroseG,
+                  fluidMl: c.delivered.fluidMl,
+                  hoursPlanned: inp.hoursPlanned,
+                });
 
-              const rateTxt = hrs.rate ? fmt(hrs.rate, 0) : "—";
+                const fullTitle = `${c.groupTitle} • ${c.variant.label} (מומלץ ${c.preferredVolMl.toLocaleString(
+                  "en-US"
+                )} mL)`;
 
-              return (
-                <button
-                  key={c.key}
-                  onClick={() => openModal(c)}
-                  className="rounded-3xl bg-white p-4 text-right shadow-sm ring-1 ring-slate-200 hover:ring-blue-200 active:scale-[0.99]"
-                >
-                  <div className="flex items-start justify-between gap-2">
-                    <div className="min-w-0">
-                      <div className="text-sm font-extrabold break-words">
-                        {fullTitle}
+                const rateTxt = hrs.rate ? fmt(hrs.rate, 0) : "—";
+
+                return (
+                  <button
+                    key={c.key}
+                    onClick={() => openModal(c)}
+                    className="rounded-3xl bg-white p-4 text-right shadow-sm ring-1 ring-slate-200 hover:ring-blue-200 active:scale-[0.99]"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="text-sm font-extrabold break-words">{fullTitle}</div>
+                        <div className="text-[11px] text-slate-500">
+                          נפח מומלץ: <b>{c.preferredVolMl.toLocaleString("en-US")} mL</b>
+                        </div>
                       </div>
-                      <div className="text-[11px] text-slate-500">
-                        נפח מומלץ:{" "}
-                        <b>{c.preferredVolMl.toLocaleString("en-US")} mL</b>
+                      <div className="h-9 w-9 shrink-0 rounded-2xl bg-blue-600 text-white flex items-center justify-center font-black">
+                        {rank}
                       </div>
                     </div>
-                    <div className="h-9 w-9 shrink-0 rounded-2xl bg-blue-600 text-white flex items-center justify-center font-black">
-                      {rank}
-                    </div>
-                  </div>
 
-                  <div className="mt-3 space-y-2">
-                    <MetricRow
-                      label="קילו-קלוריות"
-                      value={`${Math.round(c.delivered.kcal)}`}
-                      unit="kcal"
-                      pct={c.diffs.kcalPct}
-                    />
-                    <MetricRow
-                      label="חלבון"
-                      value={fmt(c.delivered.proteinG, 1)}
-                      unit="g"
-                      pct={c.diffs.proteinPct}
-                    />
-                    <MetricRow
-                      label="נוזלים"
-                      value={`${Math.round(c.delivered.fluidMl).toLocaleString(
-                        "en-US"
-                      )}`}
-                      unit="mL"
-                      pct={c.diffs.fluidPct}
-                    />
+                    <div className="mt-3 space-y-2">
+                      <MetricRow label="קילו-קלוריות" value={`${Math.round(c.delivered.kcal)}`} unit="kcal" pct={c.diffs.kcalPct} />
+                      <MetricRow label="חלבון" value={fmt(c.delivered.proteinG, 1)} unit="g" pct={c.diffs.proteinPct} />
+                      <MetricRow
+                        label="נוזלים"
+                        value={`${Math.round(c.delivered.fluidMl).toLocaleString("en-US")}`}
+                        unit="mL"
+                        pct={c.diffs.fluidPct}
+                      />
 
-                    <div className="rounded-2xl bg-blue-50 px-3 py-3 ring-1 ring-blue-200 text-xs text-slate-800">
-                      <div className="flex flex-wrap gap-x-4 gap-y-1 items-center justify-center">
-                        <span className="inline-flex items-baseline gap-1 whitespace-nowrap">
-                          <span>מינימום שעות הזנה:</span>
-                          <b>{hrs.minH ? fmt(hrs.minH, 1) : "—"}</b>
-                          <span className="text-slate-600">(מחושב לפי GIR)</span>
-                        </span>
-
-                        <span className="inline-flex items-baseline gap-1 whitespace-nowrap">
-                          <span>קצב הזנה:</span>
-                          <b>{rateTxt}</b>
-                          <span className="text-slate-600">mL/h</span>
-                          <span className="text-slate-600">
-                            ({hrs.source === "planned"
-                              ? "לפי שעות שהוזנו"
-                              : hrs.source === "min"
-                              ? "לפי שעות מינימום"
-                              : "—"})
+                      <div className="rounded-2xl bg-blue-50 px-3 py-3 ring-1 ring-blue-200 text-xs text-slate-800">
+                        <div className="flex flex-wrap gap-x-4 gap-y-1 items-center justify-center">
+                          <span className="inline-flex items-baseline gap-1 whitespace-nowrap">
+                            <span>מינימום שעות הזנה:</span>
+                            <b>{hrs.minH ? fmt(hrs.minH, 1) : "—"}</b>
+                            <span className="text-slate-600">(מחושב לפי GIR)</span>
                           </span>
-                        </span>
-                      </div>
 
-                      <div className="mt-2">
-                        <BottomLine
-                          items={[
-                            { label: "קילו-קלוריות/ק״ג:", value: fmt(kcalKg, 2) },
-                            {
-                              label: "חלבון/ק״ג:",
-                              value: fmt(protKg, 2) + " g/kg",
-                            },
-                            {
-                              label: "נוזלים/ק״ג:",
-                              value: fmt(fluidKg, 0) + " mL/kg",
-                            },
-                          ]}
-                        />
+                          <span className="inline-flex items-baseline gap-1 whitespace-nowrap">
+                            <span>קצב הזנה:</span>
+                            <b>{rateTxt}</b>
+                            <span className="text-slate-600">mL/h</span>
+                            <span className="text-slate-600">
+                              (
+                              {hrs.source === "planned"
+                                ? "לפי שעות שהוזנו"
+                                : hrs.source === "min"
+                                ? "לפי שעות מינימום"
+                                : "—"}
+                              )
+                            </span>
+                          </span>
+                        </div>
+
+                        <div className="mt-2">
+                          <BottomLine
+                            items={[
+                              { label: "קילו-קלוריות/ק״ג:", value: fmt(kcalKg, 2) },
+                              { label: "חלבון/ק״ג:", value: fmt(protKg, 2) + " g/kg" },
+                              { label: "נוזלים/ק״ג:", value: fmt(fluidKg, 0) + " mL/kg" },
+                            ]}
+                          />
+                        </div>
                       </div>
                     </div>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </section>
 
-        {/* פרטי הדפסה למטה */}
+        {/* Print details */}
         <section className="rounded-3xl bg-white p-4 shadow-sm ring-1 ring-slate-200">
           <div className="text-base font-extrabold">פרטי הדפסה</div>
           <div className="text-xs text-slate-500 mt-1">
@@ -990,68 +1004,70 @@ export default function Page() {
           </div>
 
           <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-12">
-            {/* Institution */}
             <div className="md:col-span-6 rounded-3xl bg-slate-50 p-4 ring-1 ring-slate-200">
-              <div className="text-xs font-semibold text-slate-700">
-                פרטי דיאטנית / מוסד
-              </div>
+              <div className="text-xs font-semibold text-slate-700">פרטי דיאטנית / מוסד</div>
 
               <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-2">
                 <input
                   className="rounded-2xl border border-slate-200 px-3 py-2 text-sm"
                   placeholder="בית חולים"
                   value={inp.hospital}
-                  onChange={(e) =>
-                    setInp((s) => ({ ...s, hospital: e.target.value }))
-                  }
+                  onChange={(e) => patchInp({ hospital: e.target.value })}
                 />
                 <input
                   className="rounded-2xl border border-slate-200 px-3 py-2 text-sm"
                   placeholder="מחלקה"
                   value={inp.ward}
-                  onChange={(e) =>
-                    setInp((s) => ({ ...s, ward: e.target.value }))
-                  }
+                  onChange={(e) => patchInp({ ward: e.target.value })}
                 />
                 <input
                   className="rounded-2xl border border-slate-200 px-3 py-2 text-sm"
                   placeholder="דיאטנית"
                   value={inp.dietitian}
-                  onChange={(e) =>
-                    setInp((s) => ({ ...s, dietitian: e.target.value }))
-                  }
+                  onChange={(e) => patchInp({ dietitian: e.target.value })}
                 />
                 <input
                   className="rounded-2xl border border-slate-200 px-3 py-2 text-sm"
                   placeholder="טלפון"
                   value={inp.phone}
-                  onChange={(e) =>
-                    setInp((s) => ({ ...s, phone: e.target.value }))
-                  }
+                  onChange={(e) => patchInp({ phone: e.target.value })}
                 />
 
+                <div className="md:col-span-2 grid grid-cols-1 md:grid-cols-2 gap-2 mt-1">
+                  <div>
+                    <label className="text-[11px] font-semibold text-slate-600">
+                      תאריך התחלת טיפול בבית
+                    </label>
+                    <input
+                      className="mt-2 w-full rounded-2xl border border-slate-200 px-3 py-2 text-sm bg-white"
+                      type="date"
+                      value={inp.homeStartDate}
+                      onChange={(e) => patchInp({ homeStartDate: e.target.value })}
+                    />
+                  </div>
+
+                  <div>
+                    <label className="text-[11px] font-semibold text-slate-600">תוקף המרשם</label>
+                    <input
+                      className="mt-2 w-full rounded-2xl border border-slate-200 px-3 py-2 text-sm bg-white"
+                      type="date"
+                      value={inp.prescriptionValidUntil}
+                      onChange={(e) => patchInp({ prescriptionValidUntil: e.target.value })}
+                    />
+                  </div>
+                </div>
+
                 <div className="md:col-span-2">
-                  <label className="text-[11px] font-semibold text-slate-600">
-                    סוג צנתר
-                  </label>
+                  <label className="text-[11px] font-semibold text-slate-600">סוג צנתר</label>
                   <select
                     className="mt-2 w-full rounded-2xl border border-slate-200 px-3 py-2 text-sm bg-white"
                     value={inp.catheterType}
-                    onChange={(e) =>
-                      setInp((s) => ({
-                        ...s,
-                        catheterType: e.target.value as CatheterType,
-                      }))
-                    }
+                    onChange={(e) => patchInp({ catheterType: e.target.value as CatheterType })}
                   >
                     <option value="PICC">PICC</option>
-                    <option value="Hickman / Tunnelled">
-                      Hickman / Tunnelled
-                    </option>
+                    <option value="Hickman / Tunnelled">Hickman / Tunnelled</option>
                     <option value="Port (Port-a-cath)">Port (Port-a-cath)</option>
-                    <option value="CVC (Temporary / Non-tunnelled)">
-                      CVC (Temporary / Non-tunnelled)
-                    </option>
+                    <option value="CVC (Temporary / Non-tunnelled)">CVC (Temporary / Non-tunnelled)</option>
                   </select>
                 </div>
 
@@ -1062,12 +1078,7 @@ export default function Page() {
                   <select
                     className="mt-2 w-full rounded-2xl border border-slate-200 px-3 py-2 text-sm bg-white"
                     value={clamp(Math.round(inp.treatmentDaysPerWeek), 1, 7)}
-                    onChange={(e) =>
-                      setInp((s) => ({
-                        ...s,
-                        treatmentDaysPerWeek: Number(e.target.value),
-                      }))
-                    }
+                    onChange={(e) => patchInp({ treatmentDaysPerWeek: Number(e.target.value) })}
                   >
                     {[1, 2, 3, 4, 5, 6, 7].map((d) => (
                       <option key={d} value={d}>
@@ -1079,7 +1090,6 @@ export default function Page() {
               </div>
             </div>
 
-            {/* Additives + Vitamin K + Line care */}
             <div className="md:col-span-6 rounded-3xl bg-slate-50 p-4 ring-1 ring-slate-200">
               <div className="text-xs font-semibold text-slate-700">תוספים</div>
 
@@ -1087,20 +1097,12 @@ export default function Page() {
                 <div className="rounded-2xl bg-white px-3 py-2 ring-1 ring-slate-200">
                   <div className="flex items-center justify-between">
                     <div className="text-sm font-semibold">
-                      Cernevit{" "}
-                      <span className="text-[11px] text-slate-500">
-                        (ויטמינים • מנה יומית סטנדרטית)
-                      </span>
+                      Cernevit <span className="text-[11px] text-slate-500">(ויטמינים • מנה יומית סטנדרטית)</span>
                     </div>
                     <select
                       className="rounded-xl border border-slate-200 px-2 py-1 text-sm"
                       value={inp.cernevitMl}
-                      onChange={(e) =>
-                        setInp((s) => ({
-                          ...s,
-                          cernevitMl: Number(e.target.value) as 5 | 10,
-                        }))
-                      }
+                      onChange={(e) => patchInp({ cernevitMl: Number(e.target.value) as 5 | 10 })}
                     >
                       <option value={5}>5 mL</option>
                       <option value={10}>10 mL</option>
@@ -1114,21 +1116,13 @@ export default function Page() {
                 <div className="rounded-2xl bg-white px-3 py-2 ring-1 ring-slate-200">
                   <div className="flex items-center justify-between">
                     <div className="text-sm font-semibold">
-                      Nutryelt{" "}
-                      <span className="text-[11px] text-slate-500">
-                        (יסודות קורט • מנה יומית סטנדרטית)
-                      </span>
+                      Nutryelt <span className="text-[11px] text-slate-500">(יסודות קורט • מנה יומית סטנדרטית)</span>
                     </div>
 
                     <select
                       className="rounded-xl border border-slate-200 px-2 py-1 text-sm"
                       value={inp.nutryeltMl}
-                      onChange={(e) =>
-                        setInp((s) => ({
-                          ...s,
-                          nutryeltMl: Number(e.target.value) as 10 | 20,
-                        }))
-                      }
+                      onChange={(e) => patchInp({ nutryeltMl: Number(e.target.value) as 10 | 20 })}
                     >
                       <option value={10}>10 mL</option>
                       <option value={20}>20 mL</option>
@@ -1143,206 +1137,155 @@ export default function Page() {
                 <div className="md:col-span-2 rounded-2xl bg-white px-3 py-3 ring-1 ring-slate-200">
                   <label className="flex items-center justify-between gap-2">
                     <div className="text-sm font-semibold">
-                      Vitamin K{" "}
-                      <span className="text-[11px] text-slate-500">
-                        (150 mcg/day)
-                      </span>
+                      Vitamin K <span className="text-[11px] text-slate-500">(150 mcg/day)</span>
                     </div>
                     <input
                       type="checkbox"
                       checked={inp.vitaminK150}
-                      onChange={(e) =>
-                        setInp((s) => ({ ...s, vitaminK150: e.target.checked }))
-                      }
+                      onChange={(e) => patchInp({ vitaminK150: e.target.checked })}
                       className="h-5 w-5"
                     />
                   </label>
                 </div>
               </div>
 
-              <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-2">
-                <div className="rounded-2xl bg-white p-3 ring-1 ring-slate-200">
-                  <div className="text-xs font-semibold text-slate-700">
-                    NaCl 0.9% 10cc
+              <div className="mt-4">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                  <div className="rounded-2xl bg-white p-3 ring-1 ring-slate-200">
+                    <div className="text-xs font-semibold text-slate-700">NaCl 0.9% 10cc</div>
+                    <div className="mt-1 text-sm font-extrabold">2 שטיפות ביום</div>
+                    <div className="text-[11px] text-slate-500">קבוע</div>
                   </div>
-                  <div className="mt-1 text-sm font-extrabold">2 שטיפות ביום</div>
-                  <div className="text-[11px] text-slate-500">קבוע</div>
-                </div>
 
-                <div className="rounded-2xl bg-white p-3 ring-1 ring-slate-200">
-                  <div className="flex items-center justify-between">
-                    <div className="text-xs font-semibold text-slate-700">
-                      Heparin
+                  <div className="md:col-span-2 rounded-2xl bg-white p-3 ring-1 ring-slate-200">
+                    <div className="text-xs font-extrabold text-slate-800 mb-2">
+                      Lock solution <span className="text-slate-500">(אופציונלי)</span>
                     </div>
-                    <button
-                      disabled={heparinDisabled}
-                      onClick={() =>
-                        setInp((s) => {
-                          const v = !s.wantHeparin;
-                          return {
-                            ...s,
-                            wantHeparin: v,
-                            wantTauroLock: v ? false : s.wantTauroLock,
-                            wantTaurolidine: v ? false : s.wantTaurolidine,
-                            taurolidineMl: v ? 0 : s.taurolidineMl,
-                          };
-                        })
-                      }
-                      className={cn(
-                        "rounded-2xl px-3 py-1.5 text-xs font-extrabold ring-1",
-                        heparinDisabled
-                          ? "bg-slate-100 text-slate-400 ring-slate-200 cursor-not-allowed"
-                          : inp.wantHeparin
-                          ? "bg-blue-600 text-white ring-blue-600"
-                          : "bg-slate-100 text-slate-700 ring-slate-200"
-                      )}
-                      title={
-                        heparinDisabled
-                          ? "כבה Taurolock/Taurolidine כדי לבחור הפרין"
-                          : ""
-                      }
-                    >
-                      {inp.wantHeparin ? "כולל הפרין" : "ללא הפרין"}
-                    </button>
-                  </div>
 
-                  <div
-                    className={cn(
-                      "mt-2 space-y-2",
-                      !inp.wantHeparin && "opacity-50 pointer-events-none"
-                    )}
-                  >
-                    <select
-                      className="w-full rounded-xl border border-slate-200 px-2 py-2 text-sm"
-                      value={inp.heparinDose}
-                      onChange={(e) =>
-                        setInp((s) => ({
-                          ...s,
-                          heparinDose: e.target.value as any,
-                        }))
-                      }
-                    >
-                      <option value="HEPARIN 10u/cc - 5cc">
-                        HEPARIN 10u/cc - 5cc
-                      </option>
-                      <option value="HEPARIN 100u/cc - 5cc">
-                        HEPARIN 100u/cc - 5cc
-                      </option>
-                    </select>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                      <div className="rounded-2xl bg-slate-50 p-3 ring-1 ring-slate-200">
+                        <div className="flex items-center justify-between">
+                          <div className="text-xs font-semibold text-slate-700">Heparin</div>
+                          <button
+                            disabled={heparinDisabled}
+                            onClick={() =>
+                              patchInp({
+                                wantHeparin: !inp.wantHeparin,
+                                wantTauroLock: inp.wantHeparin ? inp.wantTauroLock : false,
+                                wantTaurolidine: inp.wantHeparin ? inp.wantTaurolidine : false,
+                                taurolidineMl: inp.wantHeparin ? inp.taurolidineMl : 0,
+                              })
+                            }
+                            className={cn(
+                              "rounded-2xl px-3 py-1.5 text-xs font-extrabold ring-1",
+                              heparinDisabled
+                                ? "bg-slate-100 text-slate-400 ring-slate-200 cursor-not-allowed"
+                                : inp.wantHeparin
+                                ? "bg-blue-600 text-white ring-blue-600"
+                                : "bg-white text-slate-700 ring-slate-200"
+                            )}
+                            title={heparinDisabled ? "כבה Taurolock/Taurolidine כדי לבחור הפרין" : ""}
+                          >
+                            {inp.wantHeparin ? "כולל" : "ללא"}
+                          </button>
+                        </div>
 
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="text-[11px] text-slate-600">
-                        מס׳ שטיפות/יום
+                        <div className={cn("mt-2 space-y-2", !inp.wantHeparin && "opacity-50 pointer-events-none")}>
+                          <select
+                            className="w-full rounded-xl border border-slate-200 px-2 py-2 text-sm bg-white"
+                            value={inp.heparinDose}
+                            onChange={(e) => patchInp({ heparinDose: e.target.value as any })}
+                          >
+                            <option value="HEPARIN 10u/cc - 5cc">HEPARIN 10u/cc - 5cc</option>
+                            <option value="HEPARIN 100u/cc - 5cc">HEPARIN 100u/cc - 5cc</option>
+                          </select>
+
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="text-[11px] text-slate-600">מס׳ שטיפות/יום</div>
+                            <div className="w-20 rounded-xl border border-slate-200 px-2 py-1 text-sm text-center bg-white">
+                              1
+                            </div>
+                          </div>
+                        </div>
                       </div>
-                      <div className="w-20 rounded-xl border border-slate-200 px-2 py-1 text-sm text-center bg-slate-50">
-                        1
+
+                      <div className="rounded-2xl bg-slate-50 p-3 ring-1 ring-slate-200 space-y-2">
+                        <div className="flex items-center justify-between">
+                          <div className="text-xs font-semibold text-slate-700">TauroLock - 2 mL</div>
+                          <button
+                            disabled={tauroLockDisabled}
+                            onClick={() =>
+                              patchInp({
+                                wantTauroLock: !inp.wantTauroLock,
+                                wantHeparin: inp.wantTauroLock ? inp.wantHeparin : false,
+                                wantTaurolidine: inp.wantTauroLock ? inp.wantTaurolidine : false,
+                                taurolidineMl: inp.wantTauroLock ? inp.taurolidineMl : 0,
+                              })
+                            }
+                            className={cn(
+                              "rounded-2xl px-3 py-1.5 text-xs font-extrabold ring-1",
+                              tauroLockDisabled
+                                ? "bg-slate-100 text-slate-400 ring-slate-200 cursor-not-allowed"
+                                : inp.wantTauroLock
+                                ? "bg-blue-600 text-white ring-blue-600"
+                                : "bg-white text-slate-700 ring-slate-200"
+                            )}
+                            title={tauroLockDisabled ? "כבה Heparin/Taurolidine כדי לבחור TauroLock" : ""}
+                          >
+                            {inp.wantTauroLock ? "כן" : "לא"}
+                          </button>
+                        </div>
+
+                        <div className="flex items-center justify-between">
+                          <div className="text-xs font-semibold text-slate-700">Taurolidine 2%</div>
+                          <button
+                            disabled={taurolidineDisabled}
+                            onClick={() =>
+                              patchInp({
+                                wantTaurolidine: !inp.wantTaurolidine,
+                                wantHeparin: inp.wantTaurolidine ? inp.wantHeparin : false,
+                                wantTauroLock: inp.wantTaurolidine ? inp.wantTauroLock : false,
+                                taurolidineMl: !inp.wantTaurolidine
+                                  ? Math.max(0, inp.taurolidineMl || 2)
+                                  : 0,
+                              })
+                            }
+                            className={cn(
+                              "rounded-2xl px-3 py-1.5 text-xs font-extrabold ring-1",
+                              taurolidineDisabled
+                                ? "bg-slate-100 text-slate-400 ring-slate-200 cursor-not-allowed"
+                                : inp.wantTaurolidine
+                                ? "bg-blue-600 text-white ring-blue-600"
+                                : "bg-white text-slate-700 ring-slate-200"
+                            )}
+                            title={taurolidineDisabled ? "כבה Heparin/TauroLock כדי לבחור Taurolidine" : ""}
+                          >
+                            {inp.wantTaurolidine ? "כן" : "לא"}
+                          </button>
+                        </div>
+
+                        <div className={cn("flex items-center justify-between gap-2", !inp.wantTaurolidine && "opacity-50 pointer-events-none")}>
+                          <div className="text-[11px] text-slate-600">mL</div>
+                          <input
+                            className="w-20 rounded-xl border border-slate-200 px-2 py-1 text-sm text-center bg-white"
+                            type="number"
+                            min={0}
+                            value={inp.wantTaurolidine ? inp.taurolidineMl : 0}
+                            onChange={(e) => patchInp({ taurolidineMl: Number(e.target.value) })}
+                          />
+                        </div>
                       </div>
                     </div>
                   </div>
                 </div>
 
-                <div className="rounded-2xl bg-white p-3 ring-1 ring-slate-200 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <div className="text-xs font-semibold text-slate-700">
-                      TauroLock - 2 mL
-                    </div>
-                    <button
-                      disabled={tauroLockDisabled}
-                      onClick={() =>
-                        setInp((s) => {
-                          const v = !s.wantTauroLock;
-                          return {
-                            ...s,
-                            wantTauroLock: v,
-                            wantHeparin: v ? false : s.wantHeparin,
-                            wantTaurolidine: v ? false : s.wantTaurolidine,
-                            taurolidineMl: v ? 0 : s.taurolidineMl,
-                          };
-                        })
-                      }
-                      className={cn(
-                        "rounded-2xl px-3 py-1.5 text-xs font-extrabold ring-1",
-                        tauroLockDisabled
-                          ? "bg-slate-100 text-slate-400 ring-slate-200 cursor-not-allowed"
-                          : inp.wantTauroLock
-                          ? "bg-blue-600 text-white ring-blue-600"
-                          : "bg-slate-100 text-slate-700 ring-slate-200"
-                      )}
-                      title={
-                        tauroLockDisabled
-                          ? "כבה Heparin/Taurolidine כדי לבחור TauroLock"
-                          : ""
-                      }
-                    >
-                      {inp.wantTauroLock ? "כן" : "לא"}
-                    </button>
-                  </div>
-
-                  <div className="flex items-center justify-between">
-                    <div className="text-xs font-semibold text-slate-700">
-                      Taurolidine 2%
-                    </div>
-                    <button
-                      disabled={taurolidineDisabled}
-                      onClick={() =>
-                        setInp((s) => {
-                          const v = !s.wantTaurolidine;
-                          return {
-                            ...s,
-                            wantTaurolidine: v,
-                            wantHeparin: v ? false : s.wantHeparin,
-                            wantTauroLock: v ? false : s.wantTauroLock,
-                            taurolidineMl: v ? Math.max(0, s.taurolidineMl || 2) : 0,
-                          };
-                        })
-                      }
-                      className={cn(
-                        "rounded-2xl px-3 py-1.5 text-xs font-extrabold ring-1",
-                        taurolidineDisabled
-                          ? "bg-slate-100 text-slate-400 ring-slate-200 cursor-not-allowed"
-                          : inp.wantTaurolidine
-                          ? "bg-blue-600 text-white ring-blue-600"
-                          : "bg-slate-100 text-slate-700 ring-slate-200"
-                      )}
-                      title={
-                        taurolidineDisabled
-                          ? "כבה Heparin/TauroLock כדי לבחור Taurolidine"
-                          : ""
-                      }
-                    >
-                      {inp.wantTaurolidine ? "כן" : "לא"}
-                    </button>
-                  </div>
-
-                  <div
-                    className={cn(
-                      "flex items-center justify-between gap-2",
-                      !inp.wantTaurolidine && "opacity-50 pointer-events-none"
-                    )}
-                  >
-                    <div className="text-[11px] text-slate-600">mL</div>
-                    <input
-                      className="w-20 rounded-xl border border-slate-200 px-2 py-1 text-sm text-center"
-                      type="number"
-                      min={0}
-                      value={inp.wantTaurolidine ? inp.taurolidineMl : 0}
-                      onChange={(e) =>
-                        setInp((s) => ({
-                          ...s,
-                          taurolidineMl: Number(e.target.value),
-                        }))
-                      }
-                    />
-                  </div>
-                </div>
+                <textarea
+                  className="mt-3 w-full rounded-2xl border border-slate-200 px-3 py-2 text-sm min-h-[80px] bg-white"
+                  placeholder="הערות (להדפסה)"
+                  value={inp.notes}
+                  onChange={(e) => patchInp({ notes: e.target.value })}
+                />
               </div>
-
-              <textarea
-                className="mt-3 w-full rounded-2xl border border-slate-200 px-3 py-2 text-sm min-h-[80px]"
-                placeholder="הערות (להדפסה)"
-                value={inp.notes}
-                onChange={(e) => setInp((s) => ({ ...s, notes: e.target.value }))}
-              />
             </div>
           </div>
         </section>
@@ -1350,10 +1293,7 @@ export default function Page() {
         {/* Modal */}
         {selected && modalBase && modalCalc ? (
           <div className="fixed inset-0 z-50">
-            <div
-              className="absolute inset-0 bg-black/40"
-              onClick={() => setOpenKey(null)}
-            />
+            <div className="absolute inset-0 bg-black/40" onClick={() => setOpenKey(null)} />
             <div className="absolute inset-0 flex items-end justify-center p-3 sm:items-center">
               <div className="w-full max-w-5xl rounded-t-3xl bg-white shadow-xl ring-1 ring-slate-200 sm:rounded-3xl">
                 <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
@@ -1372,9 +1312,7 @@ export default function Page() {
                   <div className="rounded-3xl bg-slate-50 p-4 ring-1 ring-slate-200">
                     <div className="flex items-center justify-between">
                       <div className="text-sm font-extrabold">בחירת נפח</div>
-                      <div className="text-xs text-slate-500">
-                        מובנה לפי התמיסה + אפשרות נפח חלקי
-                      </div>
+                      <div className="text-xs text-slate-500">מובנה לפי התמיסה + אפשרות נפח חלקי</div>
                     </div>
 
                     <div className="mt-3 flex flex-wrap gap-2">
@@ -1398,9 +1336,7 @@ export default function Page() {
                     </div>
 
                     <div className="mt-3">
-                      <div className="text-xs font-semibold text-slate-700">
-                        נפח (mL)
-                      </div>
+                      <div className="text-xs font-semibold text-slate-700">נפח (mL)</div>
                       <input
                         type="range"
                         min={500}
@@ -1424,29 +1360,17 @@ export default function Page() {
                     <div className="flex items-center justify-between">
                       <div className="text-sm font-extrabold">סיכום לפני הדפסה</div>
                       <div className="text-xs text-slate-600">
-                        NPC: <b>{Math.round(modalCalc.delivered.npcKcal)} kcal</b>{" "}
-                        • N: <b>{fmt(modalCalc.nG, 2)} g</b>
+                        NPC: <b>{Math.round(modalCalc.delivered.npcKcal)} kcal</b> • N:{" "}
+                        <b>{fmt(modalCalc.nG, 2)} g</b>
                       </div>
                     </div>
 
                     <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-3">
-                      <MetricRow
-                        label="קילו-קלוריות"
-                        value={`${Math.round(modalCalc.delivered.kcal)}`}
-                        unit="kcal"
-                        pct={modalCalc.diffs.kcalPct}
-                      />
-                      <MetricRow
-                        label="חלבון"
-                        value={fmt(modalCalc.delivered.proteinG, 1)}
-                        unit="g"
-                        pct={modalCalc.diffs.proteinPct}
-                      />
+                      <MetricRow label="קילו-קלוריות" value={`${Math.round(modalCalc.delivered.kcal)}`} unit="kcal" pct={modalCalc.diffs.kcalPct} />
+                      <MetricRow label="חלבון" value={fmt(modalCalc.delivered.proteinG, 1)} unit="g" pct={modalCalc.diffs.proteinPct} />
                       <MetricRow
                         label="נוזלים"
-                        value={Math.round(modalCalc.delivered.fluidMl).toLocaleString(
-                          "en-US"
-                        )}
+                        value={Math.round(modalCalc.delivered.fluidMl).toLocaleString("en-US")}
                         unit="mL"
                         pct={modalCalc.diffs.fluidPct}
                       />
@@ -1455,65 +1379,40 @@ export default function Page() {
                     <div className="mt-3 rounded-2xl bg-blue-50 p-3 ring-1 ring-blue-200 text-sm">
                       <BottomLine
                         items={[
-                          {
-                            label: "קילו-קלוריות/ק״ג:",
-                            value: fmt(modalCalc.delivered.kcal / w, 2),
-                          },
-                          {
-                            label: "חלבון/ק״ג:",
-                            value:
-                              fmt(modalCalc.delivered.proteinG / w, 2) + " g/kg",
-                          },
-                          {
-                            label: "נוזלים/ק״ג:",
-                            value: fmt(modalCalc.delivered.fluidMl / w, 0) + " mL/kg",
-                          },
+                          { label: "קילו-קלוריות/ק״ג:", value: fmt(modalCalc.delivered.kcal / modalCalc.w, 2) },
+                          { label: "חלבון/ק״ג:", value: fmt(modalCalc.delivered.proteinG / modalCalc.w, 2) + " g/kg" },
+                          { label: "נוזלים/ק״ג:", value: fmt(modalCalc.delivered.fluidMl / modalCalc.w, 0) + " mL/kg" },
                         ]}
                       />
 
                       <div className="mt-2 text-[11px] text-slate-700 text-center">
-                        NPC:N:{" "}
-                        <b>
-                          {modalCalc.delivered.npcToN
-                            ? fmt(modalCalc.delivered.npcToN, 1)
-                            : "—"}
-                        </b>
+                        NPC:N: <b>{modalCalc.delivered.npcToN ? fmt(modalCalc.delivered.npcToN, 1) : "—"}</b>
                         <span className="mx-2">•</span>
-                        N:NPC:{" "}
-                        <b>
-                          {modalCalc.delivered.nToNpc
-                            ? fmt(modalCalc.delivered.nToNpc, 4)
-                            : "—"}
-                        </b>
+                        N:NPC: <b>{modalCalc.delivered.nToNpc ? fmt(modalCalc.delivered.nToNpc, 4) : "—"}</b>
                       </div>
 
                       <div className="mt-2 text-[11px] text-slate-700 text-center">
-                        קצב הזנה:{" "}
-                        <b>{modalCalc.hrs.rate ? fmt(modalCalc.hrs.rate, 0) : "—"}</b>{" "}
+                        קצב הזנה: <b>{modalCalc.hrs.rate ? fmt(modalCalc.hrs.rate, 0) : "—"}</b>{" "}
                         <span className="text-slate-600">mL/h</span>{" "}
                         <span className="text-slate-600">
-                          ({modalCalc.hrs.source === "planned"
+                          (
+                          {modalCalc.hrs.source === "planned"
                             ? "לפי שעות שהוזנו"
                             : modalCalc.hrs.source === "min"
                             ? "לפי שעות מינימום"
-                            : "—"})
+                            : "—"}
+                          )
                         </span>
                       </div>
                     </div>
 
+                    {/* ✅ רק כפתור הדפסה + סגור */}
                     <div className="mt-3 flex flex-wrap gap-2 justify-between border-t border-slate-200 pt-3">
                       <button
-                        onClick={printPrescription}
+                        onClick={requestPrintWithExposure}
                         className="rounded-2xl bg-blue-600 px-4 py-2 text-xs font-extrabold text-white"
                       >
                         🖨️ הדפסה על מרשם
-                      </button>
-
-                      <button
-                        onClick={emailToSelfFromSummary}
-                        className="rounded-2xl bg-blue-50 px-4 py-2 text-xs font-extrabold text-blue-800 ring-1 ring-blue-200"
-                      >
-                        ✉️ שליחה למייל עצמי
                       </button>
 
                       <button
@@ -1526,38 +1425,91 @@ export default function Page() {
                   </div>
 
                   {/* Electrolytes */}
-                  <div className="rounded-3xl bg-white p-4 ring-1 ring-slate-200">
-                    <div className="text-sm font-extrabold">אלקטרוליטים</div>
+                  <div className="rounded-3xl bg-yellow-50 p-4 ring-1 ring-yellow-200">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="text-sm font-extrabold text-yellow-900">אלקטרוליטים</div>
+                      <div className="text-[11px] text-yellow-900/70">ליום ולפי ק״ג</div>
+                    </div>
 
                     {modalCalc.delivered.electrolytes ? (
-                      <>
-                        <div className="mt-2 text-xs text-slate-700">
-                          <b>mmol/day:</b>{" "}
-                          Na {fmt(modalCalc.delivered.electrolytes.na, 1)} • K{" "}
-                          {fmt(modalCalc.delivered.electrolytes.k, 1)} • Mg{" "}
-                          {fmt(modalCalc.delivered.electrolytes.mg, 1)} • Ca{" "}
-                          {fmt(modalCalc.delivered.electrolytes.ca, 1)} • Phos{" "}
-                          {fmt(modalCalc.delivered.electrolytes.phos, 1)} • Cl{" "}
-                          {fmt(modalCalc.delivered.electrolytes.chloride, 1)} •
-                          Acetate {fmt(modalCalc.delivered.electrolytes.acetate, 1)}
+                      <div className="mt-3 grid grid-cols-1 gap-3">
+                        <div className="rounded-2xl bg-white/70 p-3 ring-1 ring-yellow-200">
+                          <div className="text-[11px] font-extrabold text-yellow-900">mmol/day</div>
+                          <div className="mt-1 text-xs text-slate-800 leading-relaxed">
+                            Na {fmt(modalCalc.delivered.electrolytes.na, 1)} • K{" "}
+                            {fmt(modalCalc.delivered.electrolytes.k, 1)} • Mg{" "}
+                            {fmt(modalCalc.delivered.electrolytes.mg, 1)} • Ca{" "}
+                            {fmt(modalCalc.delivered.electrolytes.ca, 1)} • Phos{" "}
+                            {fmt(modalCalc.delivered.electrolytes.phos, 1)} • Cl{" "}
+                            {fmt(modalCalc.delivered.electrolytes.chloride, 1)} • Acetate{" "}
+                            {fmt(modalCalc.delivered.electrolytes.acetate, 1)}
+                          </div>
                         </div>
 
-                        <div className="mt-2 text-[11px] text-slate-600">
-                          <b>mmol/kg:</b>{" "}
-                          Na {fmt(modalCalc.delivered.electrolytes.na / w, 2)} • K{" "}
-                          {fmt(modalCalc.delivered.electrolytes.k / w, 2)} • Mg{" "}
-                          {fmt(modalCalc.delivered.electrolytes.mg / w, 2)} • Ca{" "}
-                          {fmt(modalCalc.delivered.electrolytes.ca / w, 2)} • Phos{" "}
-                          {fmt(modalCalc.delivered.electrolytes.phos / w, 2)} • Cl{" "}
-                          {fmt(modalCalc.delivered.electrolytes.chloride / w, 2)} •
-                          Acetate{" "}
-                          {fmt(modalCalc.delivered.electrolytes.acetate / w, 2)}
+                        <div className="rounded-2xl bg-white/70 p-3 ring-1 ring-yellow-200">
+                          <div className="text-[11px] font-extrabold text-yellow-900">mmol/kg</div>
+                          <div className="mt-1 text-xs text-slate-800 leading-relaxed">
+                            Na {fmt(modalCalc.delivered.electrolytes.na / modalCalc.w, 2)} • K{" "}
+                            {fmt(modalCalc.delivered.electrolytes.k / modalCalc.w, 2)} • Mg{" "}
+                            {fmt(modalCalc.delivered.electrolytes.mg / modalCalc.w, 2)} • Ca{" "}
+                            {fmt(modalCalc.delivered.electrolytes.ca / modalCalc.w, 2)} • Phos{" "}
+                            {fmt(modalCalc.delivered.electrolytes.phos / modalCalc.w, 2)} • Cl{" "}
+                            {fmt(modalCalc.delivered.electrolytes.chloride / modalCalc.w, 2)} • Acetate{" "}
+                            {fmt(modalCalc.delivered.electrolytes.acetate / modalCalc.w, 2)}
+                          </div>
                         </div>
-                      </>
+                      </div>
                     ) : (
-                      <div className="mt-2 text-sm text-slate-500">—</div>
+                      <div className="mt-2 text-sm text-slate-600">—</div>
                     )}
                   </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        {/* Exposure Modal (PRINT ONLY) */}
+        {askExposureOpen ? (
+          <div className="fixed inset-0 z-[60]">
+            <div className="absolute inset-0 bg-black/40" onClick={() => setAskExposureOpen(false)} />
+            <div className="absolute inset-0 flex items-center justify-center p-4">
+              <div className="w-full max-w-md rounded-3xl bg-white shadow-xl ring-1 ring-slate-200">
+                <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
+                  <div className="text-sm font-extrabold">שקית חשיפה לתמיסה</div>
+                  <button
+                    onClick={() => setAskExposureOpen(false)}
+                    className="rounded-xl bg-slate-100 px-3 py-1.5 text-xs font-bold text-slate-700 ring-1 ring-slate-200"
+                  >
+                    סגור
+                  </button>
+                </div>
+
+                <div className="p-4 space-y-3">
+                  <div className="text-sm text-slate-700">האם לשלוח שקית חשיפה לתמיסה?</div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      className="rounded-2xl bg-blue-600 px-3 py-3 text-xs font-extrabold text-white"
+                      onClick={() => {
+                        setAskExposureOpen(false);
+                        printPrescription(true);
+                      }}
+                    >
+                      כן
+                    </button>
+                    <button
+                      className="rounded-2xl bg-slate-100 px-3 py-3 text-xs font-extrabold text-slate-800 ring-1 ring-slate-200"
+                      onClick={() => {
+                        setAskExposureOpen(false);
+                        printPrescription(false);
+                      }}
+                    >
+                      לא
+                    </button>
+                  </div>
+
+                  <div className="text-[11px] text-slate-500">הבחירה תופיע בהדפסה.</div>
                 </div>
               </div>
             </div>
@@ -1567,10 +1519,7 @@ export default function Page() {
         {/* Pharmacist modal */}
         {pharmOpen ? (
           <div className="fixed inset-0 z-50">
-            <div
-              className="absolute inset-0 bg-black/40"
-              onClick={() => setPharmOpen(false)}
-            />
+            <div className="absolute inset-0 bg-black/40" onClick={() => setPharmOpen(false)} />
             <div className="absolute inset-0 flex items-center justify-center p-4">
               <div className="w-full max-w-md rounded-3xl bg-white shadow-xl ring-1 ring-slate-200">
                 <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
@@ -1590,12 +1539,8 @@ export default function Page() {
                       href={`tel:${x.phone.replace(/-/g, "")}`}
                       className="flex items-center justify-between rounded-2xl bg-blue-50 px-3 py-3 ring-1 ring-blue-200 active:scale-[0.99]"
                     >
-                      <div className="text-sm font-extrabold text-blue-800">
-                        {x.label}
-                      </div>
-                      <div className="text-sm font-black text-blue-900">
-                        {x.phone}
-                      </div>
+                      <div className="text-sm font-extrabold text-blue-800">{x.label}</div>
+                      <div className="text-sm font-black text-blue-900">{x.phone}</div>
                     </a>
                   ))}
                   <div className="pt-2 text-[11px] text-slate-500">

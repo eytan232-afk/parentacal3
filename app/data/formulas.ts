@@ -47,12 +47,12 @@ export const STD_ELECTROLYTES_FROM_TRIOMEL_N7E_1P5: Electrolytes = {
 
 export const formulas: Formula[] = [
   /**
-   * Standard – ClinOleic (UPDATED)
+   * Standard C (ClinOleic)
    */
   {
     id: "std-clinoleic",
     brand: "Standard",
-    name: "ClinOleic",
+    name: "C (ClinOleic)",
     route: "Central",
     isStandard: true,
     variants: [
@@ -70,12 +70,12 @@ export const formulas: Formula[] = [
   },
 
   /**
-   * Standard – SMOFlipid (unchanged)
+   * Standard S (SMOFlipid)
    */
   {
     id: "std-smoflipid",
     brand: "Standard",
-    name: "SMOFlipid",
+    name: "S (SMOFlipid)",
     route: "Central",
     isStandard: true,
     variants: [
@@ -233,7 +233,8 @@ export const formulas: Formula[] = [
   },
 
   /**
-   * TRIOMEL N4E – Peripheral (NEW)
+   * TRIOMEL N4E – Peripheral
+   * Electrolytes לפי המניפה
    */
   {
     id: "triomel-n4e-periph",
@@ -249,6 +250,15 @@ export const formulas: Formula[] = [
         glucoseG: 150,
         lipidsG: 60,
         npcPerN: 150,
+        electrolytes: {
+          na: 42,
+          k: 32,
+          mg: 4.4,
+          ca: 4,
+          phos: 17,
+          acetate: 55,
+          chloride: 49,
+        },
       },
       {
         label: "2.5L",
@@ -258,6 +268,15 @@ export const formulas: Formula[] = [
         glucoseG: 187.5,
         lipidsG: 75,
         npcPerN: 150,
+        electrolytes: {
+          na: 52.5,
+          k: 40,
+          mg: 5.5,
+          ca: 5,
+          phos: 21.2,
+          acetate: 69,
+          chloride: 61,
+        },
       },
     ],
   },
